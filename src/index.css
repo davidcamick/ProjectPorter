@@ -1,0 +1,132 @@
+@import "tailwindcss";
+
+:root {
+  color-scheme: light;
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI",
+    sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  background: #f6f6f3;
+}
+
+button,
+input,
+select {
+  font: inherit;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.btn-primary,
+.btn-secondary,
+.btn-danger,
+.btn-ghost {
+  display: inline-flex;
+  min-height: 2.5rem;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  border-radius: 0.5rem;
+  padding: 0.625rem 0.9rem;
+  font-size: 0.875rem;
+  font-weight: 600;
+  line-height: 1;
+  transition:
+    background-color 160ms ease,
+    border-color 160ms ease,
+    color 160ms ease,
+    box-shadow 160ms ease;
+}
+
+.btn-primary {
+  border: 1px solid #1c1917;
+  background: #1c1917;
+  color: white;
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: #292524;
+  box-shadow: 0 8px 24px rgb(28 25 23 / 14%);
+}
+
+.btn-secondary {
+  border: 1px solid #d6d3d1;
+  background: white;
+  color: #1c1917;
+}
+
+.btn-secondary:hover:not(:disabled),
+.btn-ghost:hover:not(:disabled) {
+  border-color: #a8a29e;
+  background: #fafaf9;
+}
+
+.btn-danger {
+  border: 1px solid #991b1b;
+  background: #b91c1c;
+  color: white;
+}
+
+.btn-danger:hover:not(:disabled) {
+  background: #991b1b;
+  box-shadow: 0 8px 24px rgb(153 27 27 / 16%);
+}
+
+.btn-ghost {
+  border: 1px solid transparent;
+  background: transparent;
+  color: #44403c;
+}
+
+.input {
+  width: 100%;
+  border-radius: 0.5rem;
+  border: 1px solid #d6d3d1;
+  background: white;
+  padding: 0.625rem 0.75rem;
+  color: #1c1917;
+  outline: none;
+  transition:
+    border-color 160ms ease,
+    box-shadow 160ms ease;
+}
+
+.input:focus {
+  border-color: #0f766e;
+  box-shadow: 0 0 0 3px rgb(20 184 166 / 18%);
+}
+
+.choice {
+  display: flex;
+  min-height: 2.75rem;
+  align-items: center;
+  gap: 0.625rem;
+  border-radius: 0.5rem;
+  border: 1px solid #d6d3d1;
+  background: white;
+  padding: 0.65rem 0.75rem;
+  font-size: 0.875rem;
+  font-weight: 600;
+  color: #292524;
+}
+
+.choice input {
+  width: 1rem;
+  height: 1rem;
+  accent-color: #1c1917;
+}
