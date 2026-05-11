@@ -45,8 +45,15 @@ export type FileCopyProgress = {
 export type CopyOptions = {
   sourceRelativePath?: string
   destinationRelativePath?: string
+  verifyFileCopy?: boolean
+  progressGranularity?: 'adaptive' | 'full' | 'completion'
   onProgress?: (progress: FileCopyProgress) => void
 }
+
+const FAST_SINGLE_WRITE_MAX_BYTES = 256 * 1024 * 1024
+const COPY_CHUNK_SIZE_BYTES = 512 * 1024 * 1024
+const PROGRESS_REPORT_INTERVAL_MS = 250
+const PROGRESS_REPORT_PERCENT_DELTA = 1
 
 export async function pickSourceDirectory() {
   return window.showDirectoryPicker({ mode: 'readwrite' })
@@ -181,39 +188,62 @@ export async function copyFile(
   const writable = await destinationFileHandle.createWritable()
   const sourcePath = options.sourceRelativePath ?? sourceFile.name
   const destinationPath = joinRelativePath([options.destinationRelativePath, uniqueName])
+  const progressGranularity = options.progressGranularity ?? 'adaptive'
+  const verifyCopiedFile = options.verifyFileCopy ?? true
   let bytesCopied = 0
+  let lastReportAt = 0
+  let lastReportPercent = -1
 
-  options.onProgress?.({
-    sourcePath,
-    destinationPath,
-    fileName: sourceFile.name,
-    bytesCopied,
-    totalBytes: sourceFile.size,
-    percent: sourceFile.size === 0 ? 100 : 0,
-    phase: 'copying',
-  })
+  function reportProgress(phase: FileCopyProgress['phase'], force = false) {
+    if (!options.onProgress) {
+      return
+    }
 
-  try {
-    const reader = sourceFile.stream().getReader()
+    if (progressGranularity === 'completion' && phase !== 'done') {
+      return
+    }
 
-    while (true) {
-      const { done, value } = await reader.read()
+    if (progressGranularity === 'adaptive' && sourceFile.size <= FAST_SINGLE_WRITE_MAX_BYTES && phase !== 'done') {
+      return
+    }
 
-      if (done) {
-        break
-      }
+    const percent = sourceFile.size === 0 ? 100 : Math.min(100, (bytesCopied / sourceFile.size) * 100)
+    const now = performance.now()
 
-      await writable.write(value)
-      bytesCopied += value.byteLength
+    if (
+      force ||
+      phase !== 'copying' ||
+      now - lastReportAt >= PROGRESS_REPORT_INTERVAL_MS ||
+      percent - lastReportPercent >= PROGRESS_REPORT_PERCENT_DELTA
+    ) {
+      lastReportAt = now
+      lastReportPercent = percent
       options.onProgress?.({
         sourcePath,
         destinationPath,
         fileName: sourceFile.name,
         bytesCopied,
         totalBytes: sourceFile.size,
-        percent: sourceFile.size === 0 ? 100 : Math.min(100, (bytesCopied / sourceFile.size) * 100),
-        phase: 'copying',
+        percent,
+        phase,
       })
+    }
+  }
+
+  reportProgress('copying', true)
+
+  try {
+    if (!options.onProgress || sourceFile.size <= FAST_SINGLE_WRITE_MAX_BYTES) {
+      await writable.write(sourceFile)
+      bytesCopied = sourceFile.size
+      reportProgress('copying', true)
+    } else {
+      while (bytesCopied < sourceFile.size) {
+        const nextByte = Math.min(bytesCopied + COPY_CHUNK_SIZE_BYTES, sourceFile.size)
+        await writable.write(sourceFile.slice(bytesCopied, nextByte))
+        bytesCopied = nextByte
+        reportProgress('copying')
+      }
     }
 
     await writable.close()
@@ -222,26 +252,13 @@ export async function copyFile(
     throw error
   }
 
-  options.onProgress?.({
-    sourcePath,
-    destinationPath,
-    fileName: sourceFile.name,
-    bytesCopied: sourceFile.size,
-    totalBytes: sourceFile.size,
-    percent: 100,
-    phase: 'verifying',
-  })
+  bytesCopied = sourceFile.size
+  if (verifyCopiedFile) {
+    reportProgress('verifying', true)
+    await verifyFileCopy(sourceFileHandle, destinationFileHandle)
+  }
 
-  await verifyFileCopy(sourceFileHandle, destinationFileHandle)
-  options.onProgress?.({
-    sourcePath,
-    destinationPath,
-    fileName: sourceFile.name,
-    bytesCopied: sourceFile.size,
-    totalBytes: sourceFile.size,
-    percent: 100,
-    phase: 'done',
-  })
+  reportProgress('done', true)
 
   return {
     destinationName: uniqueName,
@@ -295,6 +312,8 @@ async function copyDirectoryChildren(
         ...options,
         sourceRelativePath: childSourcePath,
         destinationRelativePath: destinationBasePath,
+        verifyFileCopy: false,
+        progressGranularity: options.progressGranularity ?? 'adaptive',
       })
       summary.files += result.files
       summary.sizeBytes += result.sizeBytes

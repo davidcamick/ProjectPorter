@@ -34,6 +34,8 @@ const fontExtensions = new Set(['.otf', '.ttf', '.woff', '.woff2'])
 const lutExtensions = new Set(['.cube', '.3dl', '.look'])
 const zipExtensions = new Set(['.zip', '.rar', '.7z'])
 const rawPhotoExtensions = new Set(['.arw', '.cr2', '.cr3', '.nef', '.raf', '.dng', '.orf'])
+const projectGeneratedImageExtensions = new Set(['.jpg', '.jpeg', '.png', '.tif', '.tiff', '.exr'])
+const standardTopLevelFolders = new Set(['Project Files', 'Raw', 'Assets', 'Exports', 'Deliverables'])
 
 const exportWords = /\b(export|exports|final|finals|master|delivery|deliverable|approved|upload|posted|client|render|renders|draft|v\d+|review|youtube|instagram|tiktok|social|vertical|horizontal)\b/i
 const cameraWords = /\b(sony|a7|a7iii|fx3|fx6|canon|c70|r5|r6|blackmagic|bmpcc|gopro|iphone|camera|cam|footage|clip|clips|raw|media|video|videos)\b/i
@@ -104,6 +106,16 @@ function folderDestination(item: ManifestItem): ClassificationResult {
     }
   }
 
+  if (/\b(shutters?|sounds?|sfx|sound effects|audio)\b/.test(name)) {
+    return {
+      category: 'Assets',
+      destination: joinRelativePath(['Assets', item.name]),
+      confidence: 0.84,
+      reason: 'Existing audio/SFX asset folder.',
+      requiresReview: false,
+    }
+  }
+
   if (/^(raw|footage|raw flicks|media|clips?|videos?|camera)$/.test(name) || /^(batch|day)\s*\d+/i.test(name) || cameraWords.test(name)) {
     return {
       category: 'Raw',
@@ -120,6 +132,16 @@ function folderDestination(item: ManifestItem): ClassificationResult {
       destination: item.name.toLowerCase() === 'assets' ? 'Assets' : joinRelativePath(['Assets', item.name]),
       confidence: 0.88,
       reason: 'Existing asset/support folder.',
+      requiresReview: false,
+    }
+  }
+
+  if (/^(deliverables?|delivery|approved|client delivery)$/.test(name)) {
+    return {
+      category: 'Deliverables',
+      destination: item.name.toLowerCase() === 'deliverables' ? 'Deliverables' : joinRelativePath(['Deliverables', item.name]),
+      confidence: 0.86,
+      reason: 'Existing deliverables folder.',
       requiresReview: false,
     }
   }
@@ -279,10 +301,52 @@ export function buildDeterministicClassification(manifest: ManifestItem[]): Clas
 
 function classifyForProjectShape(item: ManifestItem, manifestByPath: Map<string, ManifestItem>): ClassificationResult {
   if (item.kind === 'folder') {
-    return folderDestination(item)
+    const baseClassification = folderDestination(item)
+    const nearestMatchingFolder = findNearestMatchingFolder(item, baseClassification.category, manifestByPath)
+
+    if (nearestMatchingFolder && shouldPreserveFolderInsideMatchingGroup(baseClassification, nearestMatchingFolder.classification)) {
+      const nestedSuffix = suffixAfterAncestor(item.relativePath, nearestMatchingFolder.item.relativePath)
+
+      return {
+        ...baseClassification,
+        destination: joinRelativePath([nearestMatchingFolder.classification.destination, nestedSuffix]),
+        reason: `${baseClassification.reason} Preserving existing ${nearestMatchingFolder.item.name} grouping.`,
+      }
+    }
+
+    return baseClassification
   }
 
   const baseClassification = fileDestination(item)
+
+  if (baseClassification.category === 'Assets' && isProjectGeneratedImageSequence(item, manifestByPath)) {
+    const nearestProjectFolder = findNearestMatchingFolder(item, 'Project Files', manifestByPath)
+    const nestedSuffix = nearestProjectFolder ? suffixAfterAncestor(item.relativePath, nearestProjectFolder.item.relativePath) : item.name
+
+    return {
+      category: 'Project Files',
+      destination: joinRelativePath([nearestProjectFolder?.classification.destination ?? 'Project Files', nestedSuffix]),
+      confidence: 0.78,
+      reason: 'Looks like an image sequence/render support file inside project-generated folders; preserving it with project files.',
+      requiresReview: false,
+    }
+  }
+
+  const nearestFolder = findNearestClassifiedFolder(item, manifestByPath)
+
+  if (nearestFolder && shouldPreserveAncestorGrouping(item, baseClassification, nearestFolder)) {
+    const nestedSuffix = suffixAfterAncestor(item.relativePath, nearestFolder.item.relativePath)
+
+    return {
+      ...baseClassification,
+      category: nearestFolder.classification.category,
+      destination: joinRelativePath([nearestFolder.classification.destination, nestedSuffix]),
+      confidence: Math.max(baseClassification.confidence, 0.82),
+      reason: `Preserving file inside existing ${nearestFolder.item.name} grouping.`,
+      requiresReview: false,
+    }
+  }
+
   const nearestMatchingFolder = findNearestMatchingFolder(item, baseClassification.category, manifestByPath)
 
   if (nearestMatchingFolder && shouldPreserveInsideFolder(item, baseClassification, nearestMatchingFolder)) {
@@ -296,6 +360,91 @@ function classifyForProjectShape(item: ManifestItem, manifestByPath: Map<string,
   }
 
   return baseClassification
+}
+
+function shouldPreserveFolderInsideMatchingGroup(classification: ClassificationResult, nearestClassification: ClassificationResult) {
+  if (classification.category !== 'Project Files') {
+    return true
+  }
+
+  const appDestination = appSpecificProjectFilesDestination(classification.destination)
+
+  if (!appDestination) {
+    return true
+  }
+
+  return nearestClassification.destination.startsWith(appDestination)
+}
+
+function appSpecificProjectFilesDestination(destination: string) {
+  const parts = splitRelativePath(destination)
+
+  if (parts[0] !== 'Project Files' || !['Premiere', 'After Effects', 'Photoshop', 'Illustrator'].includes(parts[1] ?? '')) {
+    return null
+  }
+
+  return parts.slice(0, 2).join('/')
+}
+
+function shouldPreserveAncestorGrouping(
+  _item: ManifestItem,
+  classification: ClassificationResult,
+  nearestFolder: { item: ManifestItem; classification: ClassificationResult },
+) {
+  if (classification.category === 'Project Files' || classification.category === 'Ignore' || classification.category === '_Needs Review') {
+    return false
+  }
+
+  if (nearestFolder.classification.category === 'Project Files' || nearestFolder.classification.category === '_Needs Review' || nearestFolder.classification.category === 'Ignore') {
+    return false
+  }
+
+  return nearestFolder.classification.category !== classification.category
+}
+
+function isProjectGeneratedImageSequence(item: ManifestItem, manifestByPath: Map<string, ManifestItem>) {
+  const extension = item.extension ?? extensionOf(item.name)
+
+  if (!extension || !projectGeneratedImageExtensions.has(extension)) {
+    return false
+  }
+
+  const ancestors = ancestorItems(item.relativePath, manifestByPath)
+  const insideProjectFiles = ancestors.some((ancestor) => folderDestination(ancestor).category === 'Project Files')
+
+  if (!insideProjectFiles) {
+    return false
+  }
+
+  const insideAssetsSubfolder = ancestors.some((ancestor) => folderDestination(ancestor).category === 'Assets')
+
+  if (insideAssetsSubfolder) {
+    return false
+  }
+
+  const normalizedAncestors = ancestors.map((ancestor) => normalizedName(ancestor.name))
+  const numericFrameName = /^\d{3,}\.(jpe?g|png|tiff?|exr)$/i.test(item.name)
+  const generatedFolderName = normalizedAncestors.some((name) => /\b(fills?|linked comp|frames?|sequence|render files?)\b/i.test(name) || /^\d{4,}$/.test(name))
+
+  return numericFrameName || generatedFolderName
+}
+
+function ancestorItems(relativePath: string, manifestByPath: Map<string, ManifestItem>) {
+  const parts = splitRelativePath(relativePath)
+  const ancestors: ManifestItem[] = []
+  parts.pop()
+
+  while (parts.length > 0) {
+    const ancestor = manifestByPath.get(parts.join('/'))
+
+    if (ancestor?.kind === 'folder') {
+      ancestors.unshift(ancestor)
+    }
+
+    parts.pop()
+  }
+
+  return ancestors
 }
 
 function shouldPreserveInsideFolder(
@@ -384,8 +533,9 @@ function suffixAfterAncestor(relativePath: string, ancestorPath: string) {
 }
 
 export function sanitizePlan(plan: MovePlanItem[], manifest: ManifestItem[]) {
+  const expandedPlan = expandContainerParentPlans(plan, manifest)
   const manifestPaths = new Set(manifest.map((item) => item.relativePath))
-  const sorted = plan
+  const sorted = expandedPlan
     .filter((item) => manifestPaths.has(item.sourceRelativePath))
     .sort((a, b) => {
       const depthDelta = b.sourceRelativePath.split('/').length - a.sourceRelativePath.split('/').length
@@ -395,6 +545,115 @@ export function sanitizePlan(plan: MovePlanItem[], manifest: ManifestItem[]) {
   return sorted.filter(
     (item) => !sorted.some((parent) => parent.sourceRelativePath !== item.sourceRelativePath && isNaturallyCoveredByPlannedParent(item, parent)),
   )
+}
+
+function expandContainerParentPlans(plan: MovePlanItem[], manifest: ManifestItem[]) {
+  const manifestByPath = new Map(manifest.map((item) => [item.relativePath, item]))
+  let currentPlan = [...dedupeBySource(plan)]
+
+  for (let pass = 0; pass < 5; pass += 1) {
+    const sourcesToExpand = new Set<string>()
+
+    for (const item of currentPlan) {
+      const manifestItem = manifestByPath.get(item.sourceRelativePath)
+
+      if (manifestItem?.kind !== 'folder' || item.category === 'Ignore' || item.category === '_Needs Review') {
+        continue
+      }
+
+      const hasNonNaturalDescendantMove = currentPlan.some(
+        (child) => child.sourceRelativePath !== item.sourceRelativePath && isDescendantPath(child.sourceRelativePath, item.sourceRelativePath) && !isNaturallyCoveredByPlannedParent(child, item),
+      )
+      const destinationRoot = splitRelativePath(item.destinationRelativePath)[0]
+      const destinationIsStandardRoot = item.destinationRelativePath === destinationRoot && standardTopLevelFolders.has(destinationRoot)
+      const hasSiblingTargetingSameRoot =
+        destinationIsStandardRoot &&
+        currentPlan.some((other) => {
+          if (other.sourceRelativePath === item.sourceRelativePath || !other.destinationRelativePath) {
+            return false
+          }
+
+          return splitRelativePath(other.destinationRelativePath)[0] === destinationRoot && !isNaturallyCoveredByPlannedParent(other, item)
+        })
+
+      if (hasNonNaturalDescendantMove || hasSiblingTargetingSameRoot) {
+        sourcesToExpand.add(item.sourceRelativePath)
+      }
+    }
+
+    if (sourcesToExpand.size === 0) {
+      break
+    }
+
+    const nextPlan = currentPlan.filter((item) => !sourcesToExpand.has(item.sourceRelativePath))
+
+    for (const sourceToExpand of sourcesToExpand) {
+      const parentPlan = currentPlan.find((item) => item.sourceRelativePath === sourceToExpand)
+
+      if (!parentPlan) {
+        continue
+      }
+
+      for (const child of immediateChildren(sourceToExpand, manifest)) {
+        if (nextPlan.some((item) => item.sourceRelativePath === child.relativePath)) {
+          continue
+        }
+
+        if (nextPlan.some((item) => item.sourceRelativePath !== child.relativePath && isDescendantPath(item.sourceRelativePath, child.relativePath))) {
+          continue
+        }
+
+        const childClassification = classifyForProjectShape(child, manifestByPath)
+
+        if (childClassification.category === 'Ignore') {
+          nextPlan.push({
+            id: child.id,
+            sourceRelativePath: child.relativePath,
+            destinationRelativePath: '',
+            category: 'Ignore',
+            confidence: childClassification.confidence,
+            reason: childClassification.reason,
+            requiresReview: false,
+          })
+          continue
+        }
+
+        nextPlan.push({
+          id: child.id,
+          sourceRelativePath: child.relativePath,
+          destinationRelativePath: joinRelativePath([parentPlan.destinationRelativePath, child.name]),
+          category: parentPlan.category,
+          confidence: Math.max(0.62, Math.min(parentPlan.confidence, 0.86)),
+          reason: `Preserving remaining item from ${parentPlan.sourceRelativePath} after nested organization.`,
+          requiresReview: false,
+        })
+      }
+    }
+
+    currentPlan = dedupeBySource(nextPlan)
+  }
+
+  return currentPlan
+}
+
+function dedupeBySource(plan: MovePlanItem[]) {
+  const bySource = new Map<string, MovePlanItem>()
+
+  for (const item of plan) {
+    const existing = bySource.get(item.sourceRelativePath)
+
+    if (!existing || item.confidence > existing.confidence) {
+      bySource.set(item.sourceRelativePath, item)
+    }
+  }
+
+  return [...bySource.values()]
+}
+
+function immediateChildren(parentPath: string, manifest: ManifestItem[]) {
+  const parentDepth = splitRelativePath(parentPath).length
+
+  return manifest.filter((item) => item.relativePath.startsWith(`${parentPath}/`) && splitRelativePath(item.relativePath).length === parentDepth + 1)
 }
 
 function isNaturallyCoveredByPlannedParent(child: MovePlanItem, parent: MovePlanItem) {

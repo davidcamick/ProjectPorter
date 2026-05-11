@@ -5,6 +5,7 @@ import {
   Check,
   ClipboardCheck,
   Database,
+  Download,
   FileCheck2,
   FolderOpen,
   HardDrive,
@@ -45,7 +46,7 @@ import {
 } from './lib/fileSystem.ts'
 import { createMockManifest } from './lib/mockManifest.ts'
 import { buildPreviewTree, createReviewItems, finalizeClassification, findDeliverableCandidates } from './lib/plan.ts'
-import { generateReportJson, generateReportMarkdown, type OrganizationReport } from './lib/report.ts'
+import { generateDebugLogJson, generateReportJson, generateReportMarkdown, type DebugLog, type OrganizationReport } from './lib/report.ts'
 import {
   basenameOf,
   dateFolderPrefix,
@@ -54,6 +55,7 @@ import {
   isDescendantPath,
   isSafeRelativePath,
   joinRelativePath,
+  safeFolderSegment,
 } from './lib/path.ts'
 
 type StepKey = 'folders' | 'details' | 'scan' | 'ai' | 'review' | 'deliverables' | 'apply' | 'done'
@@ -67,6 +69,33 @@ type ApplyFeedItem = {
   percent: number
   bytesCopied: number
   totalBytes: number
+  updatedAt: string
+}
+
+type ApplyProgressState = {
+  current: string
+  completed: number
+  total: number
+  completedFiles: number
+  totalFiles: number
+  copiedBytes: number
+  totalBytes: number
+}
+
+type ApplyTimingState = {
+  startedAt: string
+  finishedAt: string | null
+  durationMs: number | null
+}
+
+const emptyApplyProgress: ApplyProgressState = {
+  current: '',
+  completed: 0,
+  total: 0,
+  completedFiles: 0,
+  totalFiles: 0,
+  copiedBytes: 0,
+  totalBytes: 0,
 }
 
 const steps: Array<{ key: StepKey; label: string; icon: typeof FolderOpen }> = [
@@ -116,10 +145,14 @@ function App() {
   const [applying, setApplying] = useState(false)
   const [applyLogs, setApplyLogs] = useState<ApplyLogItem[]>([])
   const [applyFeed, setApplyFeed] = useState<ApplyFeedItem[]>([])
-  const [applyProgress, setApplyProgress] = useState({ current: '', completed: 0, total: 0 })
+  const [applyFileRecords, setApplyFileRecords] = useState<ApplyFeedItem[]>([])
+  const [applyProgress, setApplyProgress] = useState<ApplyProgressState>(emptyApplyProgress)
+  const [applyTiming, setApplyTiming] = useState<ApplyTimingState | null>(null)
   const [applyError, setApplyError] = useState('')
   const [reportPath, setReportPath] = useState('')
   const [finalTree, setFinalTree] = useState<string[]>([])
+  const [organizedProjectHandle, setOrganizedProjectHandle] = useState<FileSystemDirectoryHandle | null>(null)
+  const [debugLogStatus, setDebugLogStatus] = useState('')
 
   useEffect(() => {
     if (!folderNameTouched) {
@@ -135,6 +168,7 @@ function App() {
   const needsReviewCount = reviewItems.filter((item) => item.category === '_Needs Review' || item.requiresReview || item.warning).length
   const enabledPlanItems = reviewItems.filter((item) => item.enabled && item.category !== 'Ignore' && item.destinationRelativePath)
   const totalPlannedSize = useMemo(() => sumPlannedSize(enabledPlanItems, manifest), [enabledPlanItems, manifest])
+  const debugLogBusy = debugLogStatus.startsWith('Preparing') || debugLogStatus.startsWith('Scanning') || debugLogStatus.startsWith('Building')
   const previewTree = useMemo(
     () => buildPreviewTree(importMode ? finalFolderName : sourceRootName || 'Project Folder', reviewItems, deliverables),
     [deliverables, finalFolderName, importMode, reviewItems, sourceRootName],
@@ -161,6 +195,12 @@ function App() {
     setReviewItems([])
     setDeliverables([])
     setReviewed(false)
+    setApplyFileRecords([])
+    setApplyTiming(null)
+    setFinalTree([])
+    setReportPath('')
+    setOrganizedProjectHandle(null)
+    setDebugLogStatus('')
 
     if (!projectName.trim()) {
       setProjectName(handle.name)
@@ -199,6 +239,12 @@ function App() {
     setReviewItems([])
     setDeliverables([])
     setReviewed(false)
+    setApplyFileRecords([])
+    setApplyTiming(null)
+    setFinalTree([])
+    setReportPath('')
+    setOrganizedProjectHandle(null)
+    setDebugLogStatus('')
     setStep('details')
   }
 
@@ -214,6 +260,12 @@ function App() {
     setReviewItems([])
     setDeliverables([])
     setReviewed(false)
+    setApplyFileRecords([])
+    setApplyTiming(null)
+    setFinalTree([])
+    setReportPath('')
+    setOrganizedProjectHandle(null)
+    setDebugLogStatus('')
     setScanProgress({ ...emptyTotals, currentPath: 'Starting scan' })
 
     try {
@@ -307,13 +359,26 @@ function App() {
     setApplyError('')
     setApplyLogs([])
     setApplyFeed([])
+    setApplyFileRecords([])
+    setApplyProgress(emptyApplyProgress)
+    const applyStartedAt = new Date()
+    const applyStartedAtMs = performance.now()
+    setApplyTiming({ startedAt: applyStartedAt.toISOString(), finishedAt: null, durationMs: null })
     setFinalTree([])
     setReportPath('')
+    setOrganizedProjectHandle(null)
+    setDebugLogStatus('')
 
     const logs: ApplyLogItem[] = []
     let projectRootHandle: FileSystemDirectoryHandle | null = null
     let destinationLabel = sourceHandle.name
     let completed = 0
+    let currentApplyText = ''
+    let lastProgressUiUpdate = 0
+    let lastFeedUiUpdate = 0
+    let copiedBytes = 0
+    let completedFiles = 0
+    const fileProgressById = new Map<string, ApplyFeedItem>()
 
     const selectedDeliverablePaths = new Set(selectedDeliverables.map((item) => item.sourceRelativePath))
     const planOperations = dedupePlanOperations(enabledPlanItems).filter((item) => {
@@ -323,10 +388,38 @@ function App() {
 
       return copyDeliverables || !selectedDeliverablePaths.has(item.sourceRelativePath)
     })
+    const workSummary = buildApplyWorkSummary(planOperations, selectedDeliverables, copyDeliverables, manifest)
     const totalActions = selectedDeliverables.length + planOperations.length + 2
 
-    function setProgress(current: string) {
-      setApplyProgress({ current, completed, total: totalActions })
+    function setProgress(current: string, force = true) {
+      currentApplyText = current
+      const now = performance.now()
+
+      if (!force && now - lastProgressUiUpdate < 200) {
+        return
+      }
+
+      lastProgressUiUpdate = now
+      setApplyProgress({
+        current,
+        completed,
+        total: totalActions,
+        completedFiles: Math.min(completedFiles, workSummary.totalFiles),
+        totalFiles: workSummary.totalFiles,
+        copiedBytes: Math.min(copiedBytes, workSummary.totalBytes),
+        totalBytes: workSummary.totalBytes,
+      })
+    }
+
+    function flushFileFeed(force = false) {
+      const now = performance.now()
+
+      if (!force && now - lastFeedUiUpdate < 300) {
+        return
+      }
+
+      lastFeedUiUpdate = now
+      setApplyFeed([...fileProgressById.values()].slice(-80).reverse())
     }
 
     function addLog(log: ApplyLogItem) {
@@ -347,26 +440,30 @@ function App() {
       return (progress: FileCopyProgress) => {
         const feedId = `${operationId}:${progress.sourcePath}`
         const phaseLabel = progress.phase === 'copying' ? 'Copying' : progress.phase === 'verifying' ? 'Verifying' : 'Copied'
+        const previousItem = fileProgressById.get(feedId)
+        const previousBytes = previousItem?.bytesCopied ?? 0
+        const nextBytes = Math.max(previousBytes, progress.bytesCopied)
+        const nextItem: ApplyFeedItem = {
+          id: feedId,
+          source: progress.sourcePath,
+          destination: progress.destinationPath,
+          action,
+          phase: progress.phase,
+          percent: progress.percent,
+          bytesCopied: nextBytes,
+          totalBytes: progress.totalBytes,
+          updatedAt: new Date().toISOString(),
+        }
 
-        setApplyProgress({
-          current: `${phaseLabel}: ${progress.sourcePath} (${Math.round(progress.percent)}%)`,
-          completed,
-          total: totalActions,
-        })
-        setApplyFeed((items) => {
-          const nextItem: ApplyFeedItem = {
-            id: feedId,
-            source: progress.sourcePath,
-            destination: progress.destinationPath,
-            action,
-            phase: progress.phase,
-            percent: progress.percent,
-            bytesCopied: progress.bytesCopied,
-            totalBytes: progress.totalBytes,
-          }
-          const withoutCurrent = items.filter((item) => item.id !== feedId)
-          return [nextItem, ...withoutCurrent].slice(0, 80)
-        })
+        copiedBytes += nextBytes - previousBytes
+
+        if (previousItem?.phase !== 'done' && progress.phase === 'done') {
+          completedFiles += 1
+        }
+
+        fileProgressById.set(feedId, nextItem)
+        setProgress(`${phaseLabel}: ${progress.sourcePath} (${Math.round(progress.percent)}%)`, false)
+        flushFileFeed(false)
       }
     }
 
@@ -379,6 +476,8 @@ function App() {
         projectRootHandle = sourceHandle
         destinationLabel = sourceHandle.name
       }
+
+      setOrganizedProjectHandle(projectRootHandle)
 
       for (const deliverable of selectedDeliverables) {
         const logId = `deliverable:${deliverable.sourceRelativePath}`
@@ -403,11 +502,13 @@ function App() {
           ? await copyFile(record.handle as FileSystemFileHandle, deliverablesDirectory, destinationName, {
               sourceRelativePath: deliverable.sourceRelativePath,
               destinationRelativePath: 'Deliverables',
+              progressGranularity: 'adaptive',
               onProgress: makeProgressHandler(logId, 'copy'),
             })
           : await moveFileCopyDelete(record.handle as FileSystemFileHandle, record.parentHandle, deliverablesDirectory, destinationName, {
               sourceRelativePath: deliverable.sourceRelativePath,
               destinationRelativePath: 'Deliverables',
+              progressGranularity: 'adaptive',
               onProgress: makeProgressHandler(logId, 'move'),
             })
 
@@ -417,6 +518,8 @@ function App() {
           destination: `Deliverables/${result.destinationName}`,
           message: `${formatBytes(result.sizeBytes)} ${copyDeliverables ? 'copied' : 'moved'}`,
         })
+        flushFileFeed(true)
+        setProgress(`Finished deliverable: ${deliverable.sourceRelativePath}`)
       }
 
       for (const item of planOperations) {
@@ -433,6 +536,7 @@ function App() {
         if (!importMode && item.sourceRelativePath === item.destinationRelativePath) {
           completed += 1
           finishLog(logId, { action: 'skip', status: 'done', message: 'Already in the requested location.' })
+          setProgress(`Skipped: ${item.sourceRelativePath}`)
           continue
         }
 
@@ -451,6 +555,7 @@ function App() {
         if (!destinationName) {
           completed += 1
           finishLog(logId, { action: 'skip', status: 'done', message: 'No destination path was provided.' })
+          setProgress(`Skipped: ${item.sourceRelativePath}`)
           continue
         }
 
@@ -460,11 +565,13 @@ function App() {
             ? await moveFileCopyDelete(record.handle as FileSystemFileHandle, record.parentHandle, destinationDirectory, destinationName, {
                 sourceRelativePath: item.sourceRelativePath,
                 destinationRelativePath: parentParts.join('/'),
+                progressGranularity: 'adaptive',
                 onProgress: makeProgressHandler(logId, 'move'),
               })
             : await moveDirectoryCopyDelete(record.handle as FileSystemDirectoryHandle, record.parentHandle, destinationDirectory, destinationName, {
                 sourceRelativePath: item.sourceRelativePath,
                 destinationRelativePath: item.destinationRelativePath,
+                progressGranularity: 'adaptive',
                 onProgress: makeProgressHandler(logId, 'move'),
               })
 
@@ -474,9 +581,12 @@ function App() {
           destination: [...parentParts, result.destinationName].join('/'),
           message: `${formatBytes(result.sizeBytes)} across ${result.files} file${result.files === 1 ? '' : 's'}`,
         })
+        flushFileFeed(true)
+        setProgress(`Finished: ${item.sourceRelativePath}`)
       }
 
       setProgress('Writing reports')
+      flushFileFeed(true)
       const tree = await readDirectoryTree(projectRootHandle, 4)
       const report = buildReport(destinationLabel, logs, tree)
       await writeTextFile(projectRootHandle, 'ORGANIZATION_REPORT.json', generateReportJson(report))
@@ -489,7 +599,21 @@ function App() {
         action: 'report',
         status: 'done',
       })
-      setApplyProgress({ current: 'Complete', completed, total: totalActions })
+      setApplyProgress({
+        current: 'Complete',
+        completed,
+        total: totalActions,
+        completedFiles: workSummary.totalFiles,
+        totalFiles: workSummary.totalFiles,
+        copiedBytes: workSummary.totalBytes,
+        totalBytes: workSummary.totalBytes,
+      })
+      setApplyFileRecords([...fileProgressById.values()])
+      setApplyTiming({
+        startedAt: applyStartedAt.toISOString(),
+        finishedAt: new Date().toISOString(),
+        durationMs: Math.round(performance.now() - applyStartedAtMs),
+      })
       setFinalTree(tree)
       setReportPath(`${destinationLabel}/ORGANIZATION_REPORT.md`)
       setStep('done')
@@ -498,11 +622,16 @@ function App() {
       setApplyError(message)
       addLog({
         id: `error:${Date.now()}`,
-        source: applyProgress.current || 'Apply',
+        source: currentApplyText || 'Apply',
         destination: '',
         action: 'error',
         status: 'error',
         message,
+      })
+      setApplyTiming({
+        startedAt: applyStartedAt.toISOString(),
+        finishedAt: new Date().toISOString(),
+        durationMs: Math.round(performance.now() - applyStartedAtMs),
       })
 
       if (projectRootHandle) {
@@ -537,6 +666,117 @@ function App() {
       logs,
       warnings,
       finalTree: tree,
+    }
+  }
+
+  async function downloadDebugLog() {
+    const startedAt = new Date().toISOString()
+    setDebugLogStatus('Preparing debug log...')
+
+    try {
+      const backendHealth = await readBackendHealth()
+      let afterScan: DebugLog['afterScan'] = null
+
+      if (organizedProjectHandle) {
+        setDebugLogStatus('Scanning organized project for debug log...')
+        let lastDebugScanUpdate = 0
+        const scanResult = await scanDirectory(organizedProjectHandle, (progress) => {
+          const now = performance.now()
+
+          if (now - lastDebugScanUpdate >= 400) {
+            lastDebugScanUpdate = now
+            setDebugLogStatus(`Scanning after state: ${progress.files.toLocaleString()} files, ${progress.folders.toLocaleString()} folders`)
+          }
+        })
+        setDebugLogStatus('Building final tree for debug log...')
+        const tree = await readDirectoryTree(organizedProjectHandle, 8)
+        afterScan = {
+          rootName: organizedProjectHandle.name,
+          totals: scanResult.totals,
+          manifest: scanResult.manifest,
+          tree,
+        }
+      }
+
+      const debugLog: DebugLog = {
+        appName: 'Project Porter',
+        createdAt: new Date().toISOString(),
+        purpose: 'User-downloadable troubleshooting log for Project Porter organization runs.',
+        environment: {
+          userAgent: navigator.userAgent,
+          language: navigator.language,
+          platform: navigator.platform,
+          location: window.location.href,
+          fileSystemAccessSupported: typeof window.showDirectoryPicker === 'function',
+          backendHealth,
+        },
+        settings: {
+          projectName: projectName.trim(),
+          projectDate,
+          finalFolderName,
+          sourceRootName,
+          destinationRootName: destinationHandle?.name ?? null,
+          mode: importMode ? 'import-to-destination' : 'organize-in-place',
+          copyDeliverables,
+          mockMode,
+          reportPath,
+        },
+        workflowState: {
+          currentStep: step,
+          reviewed,
+          planSource,
+          planSummary,
+          detectedApps,
+          warnings,
+          needsReviewCount,
+          totalPlannedSizeBytes: totalPlannedSize,
+          applyError,
+        },
+        beforeScan: {
+          rootName: sourceRootName,
+          totals,
+          manifest,
+        },
+        classification: {
+          reviewItems,
+          enabledPlanItems,
+          skippedPlanItems: reviewItems.filter((item) => !item.enabled || item.category === '_Needs Review' || item.category === 'Ignore'),
+          deliverables,
+          selectedDeliverables,
+        },
+        apply: {
+          timing: applyTiming,
+          progress: applyProgress,
+          feed: applyFeed,
+          fileRecords: applyFileRecords,
+          logs: applyLogs,
+        },
+        afterScan,
+        commandOutputs: [
+          {
+            label: 'Browser runtime',
+            command: null,
+            output: 'Project Porter does not execute terminal commands from the browser, so no shell command output is captured here.',
+            exitCode: null,
+            capturedAt: startedAt,
+            note: 'Attach separate terminal output for npm run build, npm run lint, or server logs when needed.',
+          },
+        ],
+        notes: [
+          'This log intentionally excludes file contents, environment variables, and API keys.',
+          'Manifest entries include names, relative paths, extensions, sizes, modified dates, child counts, and sample children only.',
+          afterScan ? 'After scan was captured from the organized project folder.' : 'After scan was unavailable because the organized project folder handle is not available in this browser session.',
+        ],
+      }
+
+      const safeName = safeFolderSegment(projectName || sourceRootName || 'Project Porter').replace(/\s+/g, '_') || 'Project_Porter'
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+      const fileName = `${safeName}_Project_Porter_debug_log_${stamp}.json`
+
+      downloadTextFile(fileName, generateDebugLogJson(debugLog), 'application/json')
+      setDebugLogStatus(`Downloaded ${fileName}`)
+    } catch (error) {
+      setDebugLogStatus(error instanceof Error ? `Could not prepare debug log: ${error.message}` : 'Could not prepare debug log.')
     }
   }
 
@@ -824,10 +1064,41 @@ function App() {
                   <p className="text-sm text-stone-500">{applyProgress.current || 'No file operation has started.'}</p>
                 </div>
                 <span className="text-sm text-stone-500">
-                  {applyProgress.completed}/{applyProgress.total}
+                  {applyProgress.completed}/{applyProgress.total} actions
                 </span>
               </div>
-              <ProgressBar value={applyProgress.total ? (applyProgress.completed / applyProgress.total) * 100 : 0} active={applying} />
+              <div className="mt-4 grid gap-4 md:grid-cols-2">
+                <div>
+                  <div className="flex justify-between gap-3 text-xs font-medium text-stone-500">
+                    <span>Files</span>
+                    <span>
+                      {applyProgress.completedFiles}/{applyProgress.totalFiles}
+                      {applyProgress.totalFiles ? ` (${Math.round((applyProgress.completedFiles / applyProgress.totalFiles) * 100)}%)` : ''}
+                    </span>
+                  </div>
+                  <ProgressBar value={applyProgress.totalFiles ? (applyProgress.completedFiles / applyProgress.totalFiles) * 100 : 0} active={applying} />
+                </div>
+                <div>
+                  <div className="flex justify-between gap-3 text-xs font-medium text-stone-500">
+                    <span>Bytes</span>
+                    <span>
+                      {formatBytes(applyProgress.copiedBytes)} / {formatBytes(applyProgress.totalBytes)}
+                      {applyProgress.totalBytes ? ` (${Math.round((applyProgress.copiedBytes / applyProgress.totalBytes) * 100)}%)` : ''}
+                    </span>
+                  </div>
+                  <ProgressBar value={applyProgress.totalBytes ? (applyProgress.copiedBytes / applyProgress.totalBytes) * 100 : 0} active={applying} />
+                </div>
+              </div>
+              <div className="mt-4">
+                <div className="flex justify-between gap-3 text-xs font-medium text-stone-500">
+                  <span>Actions</span>
+                  <span>
+                    {applyProgress.completed}/{applyProgress.total}
+                    {applyProgress.total ? ` (${Math.round((applyProgress.completed / applyProgress.total) * 100)}%)` : ''}
+                  </span>
+                </div>
+                <ProgressBar value={applyProgress.total ? (applyProgress.completed / applyProgress.total) * 100 : 0} active={applying} />
+              </div>
             </div>
 
             <ApplyFileFeed items={applyFeed} />
@@ -868,7 +1139,12 @@ function App() {
               <button className="btn-secondary" type="button" onClick={() => setStep('review')}>
                 Review Plan Again
               </button>
+              <button className="btn-secondary" type="button" disabled={debugLogBusy} onClick={downloadDebugLog}>
+                {debugLogBusy ? <Loader2 className="size-4 animate-spin" aria-hidden="true" /> : <Download className="size-4" aria-hidden="true" />}
+                Download Debug Log
+              </button>
             </div>
+            {debugLogStatus && <p className="mt-3 text-sm text-stone-500">{debugLogStatus}</p>}
           </Workspace>
         )}
       </div>
@@ -1264,6 +1540,38 @@ function ApplyFileFeed({ items }: { items: ApplyFeedItem[] }) {
   )
 }
 
+async function readBackendHealth() {
+  try {
+    const response = await fetch('/api/health')
+    const body: unknown = await response.json().catch(() => null)
+
+    return {
+      ok: response.ok,
+      status: response.status,
+      body,
+    }
+  } catch (error) {
+    return {
+      ok: false,
+      status: null,
+      error: error instanceof Error ? error.message : 'Could not reach local backend.',
+    }
+  }
+}
+
+function downloadTextFile(fileName: string, content: string, mimeType: string) {
+  const blob = new Blob([content], { type: mimeType })
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+
+  link.href = url
+  link.download = fileName
+  document.body.appendChild(link)
+  link.click()
+  link.remove()
+  URL.revokeObjectURL(url)
+}
+
 function useStoredState(key: string, initialValue: string) {
   const [value, setValue] = useState(() => localStorage.getItem(key) ?? initialValue)
 
@@ -1292,6 +1600,51 @@ function sumPlannedSize(items: ReviewPlanItem[], manifest: ManifestItem[]) {
     const matching = manifest.filter((manifestItem) => isDescendantPath(manifestItem.relativePath, item.sourceRelativePath) && manifestItem.kind === 'file')
     return total + matching.reduce((sum, manifestItem) => sum + (manifestItem.sizeBytes ?? 0), 0)
   }, 0)
+}
+
+function buildApplyWorkSummary(
+  planOperations: ReviewPlanItem[],
+  selectedDeliverables: DeliverableCandidate[],
+  copyDeliverables: boolean,
+  manifest: ManifestItem[],
+) {
+  const manifestFiles = manifest.filter((item) => item.kind === 'file')
+  const movedSourcePaths: string[] = []
+  let totalFiles = 0
+  let totalBytes = 0
+
+  function addFile(item: ManifestItem) {
+    totalFiles += 1
+    totalBytes += item.sizeBytes ?? 0
+  }
+
+  for (const deliverable of selectedDeliverables) {
+    const file = manifestFiles.find((item) => item.relativePath === deliverable.sourceRelativePath)
+
+    if (file) {
+      addFile(file)
+    }
+
+    if (!copyDeliverables) {
+      movedSourcePaths.push(deliverable.sourceRelativePath)
+    }
+  }
+
+  for (const operation of planOperations) {
+    const files = manifestFiles.filter(
+      (item) =>
+        isDescendantPath(item.relativePath, operation.sourceRelativePath) &&
+        !movedSourcePaths.some((movedPath) => isDescendantPath(item.relativePath, movedPath)),
+    )
+
+    for (const file of files) {
+      addFile(file)
+    }
+
+    movedSourcePaths.push(operation.sourceRelativePath)
+  }
+
+  return { totalFiles, totalBytes }
 }
 
 function dedupePlanOperations(items: ReviewPlanItem[]) {

@@ -1,4 +1,4 @@
-import type { ApplyLogItem, DeliverableCandidate, ReviewPlanItem, ScanTotals } from '../../shared/types.ts'
+import type { ApplyLogItem, DeliverableCandidate, ManifestItem, ReviewPlanItem, ScanTotals } from '../../shared/types.ts'
 import { formatBytes } from './path.ts'
 
 export type OrganizationReport = {
@@ -18,8 +18,82 @@ export type OrganizationReport = {
   finalTree: string[]
 }
 
+export type DebugLog = {
+  appName: 'Project Porter'
+  createdAt: string
+  purpose: string
+  environment: {
+    userAgent: string
+    language: string
+    platform: string
+    location: string
+    fileSystemAccessSupported: boolean
+    backendHealth: unknown
+  }
+  settings: {
+    projectName: string
+    projectDate: string
+    finalFolderName: string
+    sourceRootName: string
+    destinationRootName: string | null
+    mode: 'organize-in-place' | 'import-to-destination'
+    copyDeliverables: boolean
+    mockMode: boolean
+    reportPath: string
+  }
+  workflowState: {
+    currentStep: string
+    reviewed: boolean
+    planSource: string
+    planSummary: string
+    detectedApps: string[]
+    warnings: string[]
+    needsReviewCount: number
+    totalPlannedSizeBytes: number
+    applyError: string
+  }
+  beforeScan: {
+    rootName: string
+    totals: ScanTotals
+    manifest: ManifestItem[]
+  }
+  classification: {
+    reviewItems: ReviewPlanItem[]
+    enabledPlanItems: ReviewPlanItem[]
+    skippedPlanItems: ReviewPlanItem[]
+    deliverables: DeliverableCandidate[]
+    selectedDeliverables: DeliverableCandidate[]
+  }
+  apply: {
+    timing: unknown
+    progress: unknown
+    feed: unknown[]
+    fileRecords: unknown[]
+    logs: ApplyLogItem[]
+  }
+  afterScan: null | {
+    rootName: string
+    totals: ScanTotals
+    manifest: ManifestItem[]
+    tree: string[]
+  }
+  commandOutputs: Array<{
+    label: string
+    command: string | null
+    output: string
+    exitCode: number | null
+    capturedAt: string
+    note?: string
+  }>
+  notes: string[]
+}
+
 export function generateReportJson(report: OrganizationReport) {
   return JSON.stringify(report, null, 2)
+}
+
+export function generateDebugLogJson(log: DebugLog) {
+  return JSON.stringify(log, null, 2)
 }
 
 export function generateReportMarkdown(report: OrganizationReport) {
