@@ -1,6 +1,6 @@
 # Project Porter
 
-Local-first project organizer for finished video-editing jobs. Project Porter runs in Chrome/Chromium, scans a source project folder with the File System Access API, asks a local Express backend for an OpenAI structured-output organization plan, lets you review everything, and then performs browser-side file moves with copy-verify-delete safety.
+Local-first project organizer for finished video-editing jobs. Project Porter runs in Chrome/Chromium, scans a source project folder with the File System Access API, builds a Smart Rules organization plan locally, lets you optionally ask a local Express backend for a lightweight OpenAI review of ambiguous items, and then performs browser-side file moves with copy-verify-delete safety.
 
 ## Setup
 
@@ -16,7 +16,7 @@ Local-first project organizer for finished video-editing jobs. Project Porter ru
    cp .env.example .env
    ```
 
-   Add your OpenAI API key:
+   Add your OpenAI API key only if you want to use **Smart Rules + Lightweight AI Review**:
 
    ```bash
    OPENAI_API_KEY=your_key_here
@@ -39,23 +39,23 @@ Local-first project organizer for finished video-editing jobs. Project Porter ru
 - Frontend: React, Vite, TypeScript, Tailwind CSS.
 - Browser file access: `window.showDirectoryPicker({ mode: "readwrite" })`.
 - Backend: local Express server at `server/index.ts`.
-- API endpoint: `POST /api/classify`.
+- API endpoint: `POST /api/classify`, called only when an AI organization mode is enabled.
 - OpenAI key: read only by the backend from `.env`.
 - Storage: temporary UI preferences only in `localStorage`.
 - Database/auth/cloud services: none.
 
 ## Safety Model
 
-Project Porter never uploads actual media files to the backend or OpenAI. The frontend sends only:
+Project Porter never uploads actual media files to the backend or OpenAI. In the default **Smart Rules Only** mode it makes no OpenAI call. In AI review modes, the frontend sends only compact metadata for uncertain/problematic items:
 
 - file and folder names
 - relative paths
 - extensions
 - sizes
 - modified dates
-- folder child counts and sample child names
+- folder child counts and capped sample child names
 
-The AI never performs file operations. It only returns a structured JSON plan. The user must review and approve before the browser writes anything.
+The AI never performs file operations and never returns a full move plan. It only returns structured JSON overrides for ambiguous candidates. The user must review and approve before the browser writes anything.
 
 Moves are implemented as:
 
@@ -71,7 +71,7 @@ Destination collisions are handled by appending `__2`, `__3`, and so on.
 2. Select a destination Projects folder, or choose organize in place.
 3. Confirm project name, project date, and final folder name.
 4. Scan the source folder.
-5. Generate an AI plan, with deterministic fallback if the API is unavailable.
+5. Generate a Smart Rules plan, optionally reviewed by lightweight AI overrides.
 6. Review and edit every proposed operation, including nested extractions.
 7. Select final deliverables and choose move or copy behavior.
 8. Apply organization with live per-file progress.

@@ -7,6 +7,61 @@ export function extensionOf(name: string) {
   return name.slice(dotIndex).toLowerCase()
 }
 
+export const CANONICAL_TOP_LEVEL_FOLDERS = ['Project Files', 'Raw', 'Assets', 'Exports', 'Deliverables'] as const
+
+export type CanonicalTopLevelFolder = (typeof CANONICAL_TOP_LEVEL_FOLDERS)[number]
+
+const canonicalFolderAliases: Array<[CanonicalTopLevelFolder, RegExp]> = [
+  ['Project Files', /^(project\s*files?|project\s*file|project\s*files?\s*old)$/i],
+  ['Raw', /^(raw|raws|footage|source\s*media)$/i],
+  ['Assets', /^(assets?|asset\s*library)$/i],
+  ['Exports', /^(exports?|export|finals?|renders?|drafts?|reviews?)$/i],
+  ['Deliverables', /^(deliverables?|delivery|deliveries|client\s*delivery)$/i],
+]
+
+export const hiddenSystemNames = new Set(['.ds_store', '.spotlight-v100', '.trashes', '.fseventsd', '__macosx', 'thumbs.db', 'desktop.ini'])
+
+export function normalizePathSegmentForMatching(value: string) {
+  return value.toLowerCase().replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim()
+}
+
+export function canonicalTopLevelFolderName(name: string): CanonicalTopLevelFolder | null {
+  const normalized = normalizePathSegmentForMatching(name)
+  const exact = CANONICAL_TOP_LEVEL_FOLDERS.find((folder) => normalizePathSegmentForMatching(folder) === normalized)
+
+  if (exact) {
+    return exact
+  }
+
+  return canonicalFolderAliases.find(([, pattern]) => pattern.test(normalized))?.[0] ?? null
+}
+
+export function isCanonicalFolderVariant(name: string) {
+  const canonical = canonicalTopLevelFolderName(name)
+
+  return Boolean(canonical && name !== canonical)
+}
+
+export function normalizeCanonicalDestinationPath(relativePath: string) {
+  const parts = splitRelativePath(relativePath)
+
+  if (parts.length === 0) {
+    return relativePath
+  }
+
+  const canonical = canonicalTopLevelFolderName(parts[0])
+
+  if (!canonical) {
+    return relativePath
+  }
+
+  return [canonical, ...parts.slice(1)].join('/')
+}
+
+export function isHiddenSystemPath(relativePath: string) {
+  return splitRelativePath(relativePath).some((part) => hiddenSystemNames.has(part.toLowerCase()))
+}
+
 export function joinRelativePath(parts: Array<string | null | undefined>) {
   return parts
     .filter((part): part is string => Boolean(part && part.trim()))

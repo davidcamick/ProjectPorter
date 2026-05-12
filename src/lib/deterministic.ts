@@ -1,5 +1,15 @@
 import type { ClassifyResponse, ManifestItem, MoveCategory, MovePlanItem } from '../../shared/types.ts'
-import { basenameOf, extensionOf, isDescendantPath, joinRelativePath, splitRelativePath } from './path.ts'
+import {
+  basenameOf,
+  canonicalTopLevelFolderName,
+  extensionOf,
+  isDescendantPath,
+  isHiddenSystemPath,
+  joinRelativePath,
+  normalizeCanonicalDestinationPath,
+  normalizePathSegmentForMatching,
+  splitRelativePath,
+} from './path.ts'
 
 const projectExtensions = new Map<string, { app: string; destination: string }>([
   ['.prproj', { app: 'Premiere', destination: 'Project Files/Premiere' }],
@@ -36,9 +46,14 @@ const zipExtensions = new Set(['.zip', '.rar', '.7z'])
 const rawPhotoExtensions = new Set(['.arw', '.cr2', '.cr3', '.nef', '.raf', '.dng', '.orf'])
 const projectGeneratedImageExtensions = new Set(['.jpg', '.jpeg', '.png', '.tif', '.tiff', '.exr'])
 const standardTopLevelFolders = new Set(['Project Files', 'Raw', 'Assets', 'Exports', 'Deliverables'])
+const sidecarExtensions = new Set(['.mxfindex', '.pek', '.sfk', '.xmp'])
+const cacheExtensions = new Set(['.cfa', '.ims', '.mcdb'])
 
-const exportWords = /\b(export|exports|final|finals|master|delivery|deliverable|approved|upload|posted|client|render|renders|draft|v\d+|review|youtube|instagram|tiktok|social|vertical|horizontal)\b/i
+const exportWords = /(^|[\s._-])(export|exports|final|finals|master|delivery|deliverable|approved|upload|posted|client|render|renders|draft|v\d+|review|youtube|instagram|tiktok|social|vertical|horizontal|recap)(?=$|[\s._-])/i
+const renderWords = /(^|[\s._-])(linked\s*comp|comp|render|renders|preview|v\d+|recap|social|instagram|tiktok|youtube|vertical|horizontal)(?=$|[\s._-])/i
 const cameraWords = /\b(sony|a7|a7iii|fx3|fx6|canon|c70|r5|r6|blackmagic|bmpcc|gopro|iphone|camera|cam|footage|clip|clips|raw|media|video|videos)\b/i
+const confusingFolderWords = /\b(misc|stuff|new folder|copy|copies|final maybe|maybe|sort|unsorted|to sort|old)\b/i
+const previewCacheFolderName = /^(adobe premiere pro video previews|adobe premiere pro audio previews|media cache|cache|peak files|preview files)$/i
 
 type ClassificationResult = {
   category: MoveCategory
@@ -50,11 +65,96 @@ type ClassificationResult = {
 }
 
 function normalizedName(name: string) {
-  return name.toLowerCase().replace(/[_-]+/g, ' ').trim()
+  return normalizePathSegmentForMatching(name)
+}
+
+function isPreviewOrCacheFolderName(name: string) {
+  return previewCacheFolderName.test(normalizedName(name))
+}
+
+function isCameraOriginalName(name: string, extension: string | null) {
+  if (!extension || (!videoExtensions.has(extension) && !rawPhotoExtensions.has(extension))) {
+    return false
+  }
+
+  const normalizedCameraName = name.replace(/\.(mp4|mov|mxf)\.(mp4|mov|mxf)$/i, '.$2')
+
+  return (
+    /^c\d{4,}([_\s-].*)?\.(mp4|mov|mxf)$/i.test(normalizedCameraName) ||
+    /^dc_\d{4,}([_\s-].*)?\.(mp4|mov|mxf)$/i.test(normalizedCameraName) ||
+    /^mvi_\d{4,}\.(mov|mp4)$/i.test(normalizedCameraName) ||
+    /^gopr\d{4,}\.mp4$/i.test(normalizedCameraName) ||
+    /^g[xs]\d{6,}\.mp4$/i.test(normalizedCameraName) ||
+    /^dji_\d{4,}\.(mp4|mov)$/i.test(normalizedCameraName) ||
+    /^do_\d{4,}\.mxf$/i.test(normalizedCameraName) ||
+    /^[a-z]\d{3}_c\d{3,}\.(mov|mp4|mxf)$/i.test(normalizedCameraName) ||
+    rawPhotoExtensions.has(extension)
+  )
 }
 
 function folderDestination(item: ManifestItem): ClassificationResult {
   const name = normalizedName(item.name)
+  const canonicalFolder = canonicalTopLevelFolderName(item.name)
+
+  if (isPreviewOrCacheFolderName(item.name)) {
+    return {
+      category: 'Assets',
+      destination: joinRelativePath(['Assets', item.name]),
+      confidence: 0.96,
+      reason: 'Preview/cache folder belongs with support assets, not project files or raw media.',
+      requiresReview: false,
+    }
+  }
+
+  if (canonicalFolder === 'Assets') {
+    return {
+      category: 'Assets',
+      destination: 'Assets',
+      confidence: 0.96,
+      reason: 'Existing Assets folder or variant merges into the canonical Assets folder.',
+      requiresReview: false,
+    }
+  }
+
+  if (canonicalFolder === 'Exports') {
+    return {
+      category: 'Exports',
+      destination: 'Exports',
+      confidence: 0.96,
+      reason: 'Existing export/render folder or variant merges into the canonical Exports folder.',
+      requiresReview: false,
+    }
+  }
+
+  if (canonicalFolder === 'Deliverables') {
+    return {
+      category: 'Deliverables',
+      destination: 'Deliverables',
+      confidence: 0.88,
+      reason: 'Existing Deliverables folder or variant; user-selected deliverables still require confirmation.',
+      requiresReview: false,
+    }
+  }
+
+  if (canonicalFolder === 'Raw') {
+    return {
+      category: 'Raw',
+      destination: 'Raw',
+      confidence: 0.94,
+      reason: 'Existing Raw folder or variant merges into the canonical Raw folder.',
+      requiresReview: false,
+    }
+  }
+
+  if (canonicalFolder === 'Project Files') {
+    return {
+      category: 'Project Files',
+      destination: 'Project Files',
+      confidence: 0.78,
+      reason: 'Existing project-files folder or variant.',
+      requiresReview: false,
+    }
+  }
 
   if (['project file', 'project files'].includes(name)) {
     return {
@@ -116,7 +216,7 @@ function folderDestination(item: ManifestItem): ClassificationResult {
     }
   }
 
-  if (/^(raw|footage|raw flicks|media|clips?|videos?|camera)$/.test(name) || /^(batch|day)\s*\d+/i.test(name) || cameraWords.test(name)) {
+  if (/^(raw|footage|raw flicks|raw video|media|clips?|videos?|camera)$/.test(name) || /^(batch|day)\s*\d+/i.test(name) || cameraWords.test(name)) {
     return {
       category: 'Raw',
       destination: item.name.toLowerCase() === 'raw' ? 'Raw' : joinRelativePath(['Raw', item.name]),
@@ -126,7 +226,7 @@ function folderDestination(item: ManifestItem): ClassificationResult {
     }
   }
 
-  if (/^(assets?|music|sfx|sound effects|graphics|logos?|fonts?|luts?|overlays?|images?|thumbnails?|cache|adobe cache|media cache)$/.test(name)) {
+  if (/^(assets?|music|sfx|sound effects|graphics|logos?|fonts?|luts?|overlays?|images?|thumbnails?|cache|adobe cache|media cache|peak files|preview files)$/.test(name)) {
     return {
       category: 'Assets',
       destination: item.name.toLowerCase() === 'assets' ? 'Assets' : joinRelativePath(['Assets', item.name]),
@@ -156,6 +256,16 @@ function folderDestination(item: ManifestItem): ClassificationResult {
     }
   }
 
+  if (confusingFolderWords.test(name)) {
+    return {
+      category: '_Needs Review',
+      destination: joinRelativePath(['_Needs Review', item.name]),
+      confidence: 0.28,
+      reason: 'Confusing folder name; review before moving.',
+      requiresReview: true,
+    }
+  }
+
   return {
     category: '_Needs Review',
     destination: joinRelativePath(['_Needs Review', item.name]),
@@ -168,6 +278,36 @@ function folderDestination(item: ManifestItem): ClassificationResult {
 function fileDestination(item: ManifestItem): ClassificationResult {
   const extension = item.extension ?? extensionOf(item.name)
   const projectInfo = extension ? projectExtensions.get(extension) : null
+
+  if (isHiddenSystemPath(item.relativePath)) {
+    return {
+      category: 'Ignore',
+      destination: '',
+      confidence: 0.99,
+      reason: 'Hidden/system metadata file.',
+      requiresReview: false,
+    }
+  }
+
+  if (extension && sidecarExtensions.has(extension)) {
+    return {
+      category: 'Assets',
+      destination: joinRelativePath(['Assets', '_Sidecars', item.name]),
+      confidence: 0.94,
+      reason: 'Editing sidecar/index file belongs in Assets/_Sidecars.',
+      requiresReview: false,
+    }
+  }
+
+  if (extension && cacheExtensions.has(extension)) {
+    return {
+      category: 'Assets',
+      destination: joinRelativePath(['Assets', item.name]),
+      confidence: 0.94,
+      reason: 'Editing cache database/file.',
+      requiresReview: false,
+    }
+  }
 
   if (projectInfo) {
     return {
@@ -190,6 +330,17 @@ function fileDestination(item: ManifestItem): ClassificationResult {
   }
 
   if (extension && (videoExtensions.has(extension) || rawPhotoExtensions.has(extension))) {
+    if (renderWords.test(item.name)) {
+      return {
+        category: 'Exports',
+        destination: joinRelativePath(['Exports', '_Renders', item.name]),
+        confidence: 0.88,
+        reason: 'Loose video file has render/linked-comp/review-version wording.',
+        requiresReview: false,
+        suggestedOnly: /(^|[\s._-])(final|master|delivery|deliverable|approved|upload|posted|client)(?=$|[\s._-])/i.test(item.name),
+      }
+    }
+
     if (exportWords.test(item.name)) {
       return {
         category: 'Exports',
@@ -197,23 +348,33 @@ function fileDestination(item: ManifestItem): ClassificationResult {
         confidence: 0.82,
         reason: 'Loose root video file has export/final/render wording.',
         requiresReview: false,
-        suggestedOnly: /\b(final|master|delivery|deliverable|approved|upload|posted|client)\b/i.test(item.name),
+        suggestedOnly: /(^|[\s._-])(final|master|delivery|deliverable|approved|upload|posted|client)(?=$|[\s._-])/i.test(item.name),
+      }
+    }
+
+    if (isCameraOriginalName(item.name, extension)) {
+      return {
+        category: 'Raw',
+        destination: joinRelativePath(['Raw', item.name]),
+        confidence: 0.9,
+        reason: 'Loose video/photo file matches common camera-original naming.',
+        requiresReview: false,
       }
     }
 
     return {
-      category: 'Raw',
-      destination: joinRelativePath(['Raw', '_Loose Media', item.name]),
-      confidence: cameraWords.test(item.name) ? 0.84 : 0.72,
-      reason: 'Loose root video file without final export wording.',
-      requiresReview: false,
+      category: '_Needs Review',
+      destination: joinRelativePath(['_Needs Review', item.name]),
+      confidence: cameraWords.test(item.name) ? 0.62 : 0.48,
+      reason: 'Loose video is not clearly camera-original or exported/rendered media.',
+      requiresReview: true,
     }
   }
 
   if (extension && (audioExtensions.has(extension) || imageExtensions.has(extension) || fontExtensions.has(extension) || lutExtensions.has(extension))) {
     return {
       category: 'Assets',
-      destination: joinRelativePath(['Assets', '_Loose Assets', item.name]),
+      destination: joinRelativePath(['Assets', item.name]),
       confidence: 0.76,
       reason: 'Loose root asset/support file.',
       requiresReview: false,
@@ -243,6 +404,10 @@ export function detectProjectApps(manifest: ManifestItem[]) {
   const apps = new Set<string>()
 
   for (const item of manifest) {
+    if (isHiddenSystemPath(item.relativePath)) {
+      continue
+    }
+
     const projectInfo = item.extension ? projectExtensions.get(item.extension) : null
     const name = normalizedName(item.name)
 
@@ -265,6 +430,10 @@ export function buildDeterministicClassification(manifest: ManifestItem[]): Clas
   const manifestByPath = new Map(manifest.map((item) => [item.relativePath, item]))
 
   const rawPlan: MovePlanItem[] = manifest.flatMap((item) => {
+    if (isHiddenSystemPath(item.relativePath)) {
+      return []
+    }
+
     const classification = classifyForProjectShape(item, manifestByPath)
     const rootItem = !item.relativePath.includes('/')
     const importantNestedMove = rootItem ? true : shouldPlanNestedItem(item, classification, manifestByPath)
@@ -286,6 +455,7 @@ export function buildDeterministicClassification(manifest: ManifestItem[]): Clas
         confidence: classification.confidence,
         reason: classification.reason,
         requiresReview: classification.requiresReview,
+        source: 'rules',
         suggestedOnly: classification.suggestedOnly,
       },
     ]
@@ -309,23 +479,36 @@ function classifyForProjectShape(item: ManifestItem, manifestByPath: Map<string,
 
       return {
         ...baseClassification,
-        destination: joinRelativePath([nearestMatchingFolder.classification.destination, nestedSuffix]),
+        destination: normalizeCanonicalDestinationPath(joinRelativePath([nearestMatchingFolder.classification.destination, nestedSuffix])),
         reason: `${baseClassification.reason} Preserving existing ${nearestMatchingFolder.item.name} grouping.`,
       }
     }
 
-    return baseClassification
+    return {
+      ...baseClassification,
+      destination: normalizeCanonicalDestinationPath(baseClassification.destination),
+    }
   }
 
   const baseClassification = fileDestination(item)
+  const nearestProjectFolder = findNearestMatchingFolder(item, 'Project Files', manifestByPath)
+
+  if (baseClassification.category === '_Needs Review' && nearestProjectFolder) {
+    return {
+      category: 'Project Files',
+      destination: normalizeCanonicalDestinationPath(joinRelativePath(['Project Files', '_Needs Review', item.name])),
+      confidence: 0.58,
+      reason: 'Unknown file inside an existing project-files folder; keep it with project files for user review.',
+      requiresReview: true,
+    }
+  }
 
   if (baseClassification.category === 'Assets' && isProjectGeneratedImageSequence(item, manifestByPath)) {
-    const nearestProjectFolder = findNearestMatchingFolder(item, 'Project Files', manifestByPath)
     const nestedSuffix = nearestProjectFolder ? suffixAfterAncestor(item.relativePath, nearestProjectFolder.item.relativePath) : item.name
 
     return {
       category: 'Project Files',
-      destination: joinRelativePath([nearestProjectFolder?.classification.destination ?? 'Project Files', nestedSuffix]),
+      destination: normalizeCanonicalDestinationPath(joinRelativePath([nearestProjectFolder?.classification.destination ?? 'Project Files', nestedSuffix])),
       confidence: 0.78,
       reason: 'Looks like an image sequence/render support file inside project-generated folders; preserving it with project files.',
       requiresReview: false,
@@ -340,7 +523,7 @@ function classifyForProjectShape(item: ManifestItem, manifestByPath: Map<string,
     return {
       ...baseClassification,
       category: nearestFolder.classification.category,
-      destination: joinRelativePath([nearestFolder.classification.destination, nestedSuffix]),
+      destination: normalizeCanonicalDestinationPath(joinRelativePath([nearestFolder.classification.destination, nestedSuffix])),
       confidence: Math.max(baseClassification.confidence, 0.82),
       reason: `Preserving file inside existing ${nearestFolder.item.name} grouping.`,
       requiresReview: false,
@@ -354,12 +537,15 @@ function classifyForProjectShape(item: ManifestItem, manifestByPath: Map<string,
 
     return {
       ...baseClassification,
-      destination: joinRelativePath([nearestMatchingFolder.classification.destination, nestedSuffix]),
+      destination: normalizeCanonicalDestinationPath(joinRelativePath([nearestMatchingFolder.classification.destination, nestedSuffix])),
       reason: `${baseClassification.reason} Preserving existing ${nearestMatchingFolder.item.name} grouping.`,
     }
   }
 
-  return baseClassification
+  return {
+    ...baseClassification,
+    destination: normalizeCanonicalDestinationPath(baseClassification.destination),
+  }
 }
 
 function shouldPreserveFolderInsideMatchingGroup(classification: ClassificationResult, nearestClassification: ClassificationResult) {
@@ -488,7 +674,7 @@ function shouldPlanNestedItem(
     return true
   }
 
-  const naturalDestination = joinRelativePath([parent.classification.destination, suffixAfterAncestor(item.relativePath, parent.item.relativePath)])
+  const naturalDestination = normalizeCanonicalDestinationPath(joinRelativePath([parent.classification.destination, suffixAfterAncestor(item.relativePath, parent.item.relativePath)]))
 
   return naturalDestination !== classification.destination
 }
@@ -533,7 +719,14 @@ function suffixAfterAncestor(relativePath: string, ancestorPath: string) {
 }
 
 export function sanitizePlan(plan: MovePlanItem[], manifest: ManifestItem[]) {
-  const expandedPlan = expandContainerParentPlans(plan, manifest)
+  const expandedPlan = expandContainerParentPlans(
+    plan.map((item) => ({
+      ...item,
+      source: item.source ?? 'rules',
+      destinationRelativePath: item.destinationRelativePath ? normalizeCanonicalDestinationPath(item.destinationRelativePath) : '',
+    })),
+    manifest,
+  )
   const manifestPaths = new Set(manifest.map((item) => item.relativePath))
   const sorted = expandedPlan
     .filter((item) => manifestPaths.has(item.sourceRelativePath))
@@ -614,6 +807,7 @@ function expandContainerParentPlans(plan: MovePlanItem[], manifest: ManifestItem
             confidence: childClassification.confidence,
             reason: childClassification.reason,
             requiresReview: false,
+            source: 'rules',
           })
           continue
         }
@@ -621,11 +815,12 @@ function expandContainerParentPlans(plan: MovePlanItem[], manifest: ManifestItem
         nextPlan.push({
           id: child.id,
           sourceRelativePath: child.relativePath,
-          destinationRelativePath: joinRelativePath([parentPlan.destinationRelativePath, child.name]),
+          destinationRelativePath: normalizeCanonicalDestinationPath(joinRelativePath([parentPlan.destinationRelativePath, child.name])),
           category: parentPlan.category,
           confidence: Math.max(0.62, Math.min(parentPlan.confidence, 0.86)),
           reason: `Preserving remaining item from ${parentPlan.sourceRelativePath} after nested organization.`,
           requiresReview: false,
+          source: 'rules',
         })
       }
     }
@@ -666,7 +861,7 @@ function isNaturallyCoveredByPlannedParent(child: MovePlanItem, parent: MovePlan
   }
 
   const suffix = suffixAfterAncestor(child.sourceRelativePath, parent.sourceRelativePath)
-  const naturalDestination = joinRelativePath([parent.destinationRelativePath, suffix])
+  const naturalDestination = normalizeCanonicalDestinationPath(joinRelativePath([parent.destinationRelativePath, suffix]))
 
   return child.destinationRelativePath === naturalDestination
 }

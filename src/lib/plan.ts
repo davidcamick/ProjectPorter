@@ -2,8 +2,8 @@ import type { ClassifyResponse, DeliverableCandidate, ManifestItem, MovePlanItem
 import { buildDeterministicClassification, sanitizePlan } from './deterministic.ts'
 import { basenameOf, extensionOf, isDescendantPath, isSafeRelativePath, joinRelativePath } from './path.ts'
 
-const likelyDeliverableWords = /\b(final|master|delivery|deliverable|approved|upload|posted|client)\b/i
-const exportWords = /\b(export|exports|final|finals|master|delivery|deliverable|approved|upload|posted|client|render|draft|review|youtube|instagram|tiktok|social|vertical|horizontal|v\d+)\b/i
+const likelyDeliverableWords = /(^|[\s._-])(final|master|delivery|deliverable|approved|upload|posted|client)(?=$|[\s._-])/i
+const exportWords = /(^|[\s._-])(export|exports|final|finals|master|delivery|deliverable|approved|upload|posted|client|render|draft|review|youtube|instagram|tiktok|social|vertical|horizontal|v\d+)(?=$|[\s._-])/i
 const deliverableExtensions = new Set(['.mp4', '.mov', '.m4v', '.avi', '.mxf', '.jpg', '.jpeg', '.png', '.webp', '.zip'])
 
 export function finalizeClassification(response: ClassifyResponse, manifest: ManifestItem[]): ClassifyResponse {
@@ -85,7 +85,7 @@ export function createReviewItems(plan: MovePlanItem[], manifest: ManifestItem[]
 
     return {
       ...item,
-      enabled: item.category !== 'Ignore' && item.category !== '_Needs Review' && !item.requiresReview,
+      enabled: item.category !== 'Ignore' && Boolean(item.destinationRelativePath),
       warning: warnings.join(', ') || undefined,
     }
   })

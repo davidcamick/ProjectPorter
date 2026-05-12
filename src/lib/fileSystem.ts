@@ -1,5 +1,5 @@
 import type { ManifestItem, ScanTotals } from '../../shared/types.ts'
-import { appendCollisionSuffix, extensionOf, joinRelativePath, makeManifestId, splitRelativePath } from './path.ts'
+import { appendCollisionSuffix, extensionOf, isHiddenSystemPath, joinRelativePath, makeManifestId, splitRelativePath } from './path.ts'
 
 export type SourceHandleRecord = {
   handle: FileSystemFileHandle | FileSystemDirectoryHandle
@@ -101,6 +101,7 @@ export async function scanDirectory(
           modifiedAt: null,
           childCount: childEntries.length,
           sampleChildren: childEntries.slice(0, 8),
+          hiddenSystem: isHiddenSystemPath(relativePath),
         })
         onProgress?.({ ...totals, currentPath: relativePath })
         await scanDir(childHandle, relativePath)
@@ -116,6 +117,7 @@ export async function scanDirectory(
           extension: extensionOf(name),
           sizeBytes: file.size,
           modifiedAt: new Date(file.lastModified).toISOString(),
+          hiddenSystem: isHiddenSystemPath(relativePath),
         })
         onProgress?.({ ...totals, currentPath: relativePath })
       }
@@ -294,6 +296,20 @@ export async function copyDirectory(
   } satisfies OperationResult
 }
 
+export async function copyDirectoryContents(
+  sourceDirectoryHandle: FileSystemDirectoryHandle,
+  destinationDirectoryHandle: FileSystemDirectoryHandle,
+  options: CopyOptions = {},
+) {
+  return copyDirectoryChildren(
+    sourceDirectoryHandle,
+    destinationDirectoryHandle,
+    options.sourceRelativePath ?? '',
+    options.destinationRelativePath ?? '',
+    options,
+  )
+}
+
 async function copyDirectoryChildren(
   sourceDirectoryHandle: FileSystemDirectoryHandle,
   destinationDirectoryHandle: FileSystemDirectoryHandle,
@@ -367,6 +383,54 @@ export async function removeOriginal(
   await parentHandle.removeEntry(handle.name, { recursive: handle.kind === 'directory' })
 }
 
+export async function directoryHasEntries(directoryHandle: FileSystemDirectoryHandle) {
+  for await (const _entry of directoryHandle.entries()) {
+    return true
+  }
+
+  return false
+}
+
+export async function removeEmptyDirectories(
+  directoryHandle: FileSystemDirectoryHandle,
+  rootRelativePath = '',
+  onRemove?: (relativePath: string) => void,
+) {
+  const entries: Array<[string, FileSystemFileHandle | FileSystemDirectoryHandle]> = []
+
+  for await (const [name, childHandle] of directoryHandle.entries()) {
+    entries.push([name, childHandle])
+  }
+
+  entries.sort(([left], [right]) => right.localeCompare(left))
+
+  for (const [name, childHandle] of entries) {
+    if (childHandle.kind !== 'directory') {
+      continue
+    }
+
+    const childPath = joinRelativePath([rootRelativePath, name])
+    await removeEmptyDirectories(childHandle, childPath, onRemove)
+
+    if (!(await directoryHasEntries(childHandle))) {
+      await directoryHandle.removeEntry(name)
+      onRemove?.(childPath)
+    }
+  }
+}
+
+export async function findExistingDirectoryNameCaseInsensitive(directoryHandle: FileSystemDirectoryHandle, requestedName: string) {
+  const requested = requestedName.toLowerCase()
+
+  for await (const [name, childHandle] of directoryHandle.entries()) {
+    if (childHandle.kind === 'directory' && name.toLowerCase() === requested) {
+      return name
+    }
+  }
+
+  return null
+}
+
 export async function moveFileCopyDelete(
   sourceFileHandle: FileSystemFileHandle,
   parentHandle: FileSystemDirectoryHandle,
@@ -389,6 +453,49 @@ export async function moveDirectoryCopyDelete(
   const result = await copyDirectory(sourceDirectoryHandle, destinationDirectoryHandle, destinationName, options)
   await removeOriginal(sourceDirectoryHandle, parentHandle)
   return result
+}
+
+export async function mergeDirectoryContentsCopyDelete(
+  sourceDirectoryHandle: FileSystemDirectoryHandle,
+  parentHandle: FileSystemDirectoryHandle,
+  destinationDirectoryHandle: FileSystemDirectoryHandle,
+  options: CopyOptions = {},
+) {
+  const sourceSummary = await summarizeDirectory(sourceDirectoryHandle)
+  const copiedSummary = await copyDirectoryContents(sourceDirectoryHandle, destinationDirectoryHandle, options)
+
+  if (sourceSummary.files !== copiedSummary.files || sourceSummary.sizeBytes !== copiedSummary.sizeBytes) {
+    throw new Error(`Verification failed for folder "${sourceDirectoryHandle.name}". Merged counts or sizes do not match.`)
+  }
+
+  await removeOriginal(sourceDirectoryHandle, parentHandle)
+
+  return {
+    destinationName: destinationDirectoryHandle.name,
+    sizeBytes: copiedSummary.sizeBytes,
+    files: copiedSummary.files,
+    folders: copiedSummary.folders,
+  } satisfies OperationResult
+}
+
+export async function renameDirectoryCopyDelete(
+  sourceDirectoryHandle: FileSystemDirectoryHandle,
+  parentHandle: FileSystemDirectoryHandle,
+  destinationName: string,
+  options: CopyOptions = {},
+) {
+  const tempName = await getUniqueName(parentHandle, `${destinationName}__rename_tmp`, 'folder')
+  const tempResult = await copyDirectory(sourceDirectoryHandle, parentHandle, tempName, {
+    ...options,
+    destinationRelativePath: tempName,
+  })
+  await removeOriginal(sourceDirectoryHandle, parentHandle)
+
+  const tempHandle = await parentHandle.getDirectoryHandle(tempResult.destinationName)
+  const finalResult = await copyDirectory(tempHandle, parentHandle, destinationName, options)
+  await removeOriginal(tempHandle, parentHandle)
+
+  return finalResult
 }
 
 export async function writeTextFile(directoryHandle: FileSystemDirectoryHandle, fileName: string, content: string) {
